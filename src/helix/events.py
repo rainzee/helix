@@ -250,6 +250,45 @@ class QAsyncioEventLoop(asyncio.BaseEventLoop, QObject):
 
         self._application.aboutToQuit.connect(self._about_to_quit_cb)
 
+        # Ready queue: callbacks scheduled via call_soon (non-threadsafe)
+        # are collected here and drained in batches by a single QTimer,
+        # reducing QTimer.singleShot allocation overhead.
+        from collections import deque
+        self._ready_queue: deque[QAsyncioHandle] = deque()
+        self._ready_timer = QTimer(self)
+        self._ready_timer.setInterval(0)
+        self._ready_timer.timeout.connect(self._drain_ready_queue)
+        # Max callbacks to execute before yielding back to Qt event loop
+        self._ready_batch_size = 32
+
+        # I/O throttling: limit time spent in socket notifier callbacks to
+        # leave headroom for paint events. When the budget is exceeded,
+        # notifiers are temporarily disabled and re-enabled after a pause.
+        # The budget adapts: starts at 6ms but shrinks if too many notifier
+        # callbacks fire in quick succession (sign of heavy I/O load).
+        import time as _time
+        self._io_time_budget_ns = 4_000_000  # 4ms per cycle
+        self._io_cycle_start_ns = 0
+        self._io_cycle_spent_ns = 0
+        self._io_throttled = False
+        self._io_resume_timer = QTimer(self)
+        self._io_resume_timer.setInterval(4)  # 4ms pause — full frame = 4ms I/O + 4ms paint + overhead
+        self._io_resume_timer.setSingleShot(True)
+        self._io_resume_timer.timeout.connect(self._io_resume_notifiers)
+        self._time_ns = _time.perf_counter_ns
+
+        # GC scheduling: disable automatic garbage collection and run it
+        # explicitly during idle periods (when the ready queue is empty and
+        # no I/O is being throttled). This prevents GC pauses from interrupting
+        # rendering or I/O processing during busy periods.
+        import gc as _gc
+        self._gc = _gc
+        self._gc_enabled = True
+        self._gc_original_thresholds = _gc.get_threshold()
+        self._gc_interval_ns = 50_000_000  # run GC at most every 50ms
+        self._gc_last_run_ns = 0
+        _gc.disable()
+
         if _PERF_ENABLED:
             log_event("event_loop.created", quit_qapp=quit_qapp)
 
@@ -351,7 +390,47 @@ class QAsyncioEventLoop(asyncio.BaseEventLoop, QObject):
             self._remove_writer(fd)
         if self._default_executor is not None:
             self._default_executor.shutdown(wait=False)
+        self._ready_timer.stop()
+        self._ready_queue.clear()
+        self._io_resume_timer.stop()
+        # Restore automatic GC
+        self._gc.enable()
+        self._gc.set_threshold(*self._gc_original_thresholds)
         self._closed = True
+
+    @Slot()
+    def _drain_ready_queue(self) -> None:
+        """Drain up to _ready_batch_size callbacks from the ready queue.
+
+        This replaces per-callback QTimer.singleShot(0) with a single
+        persistent timer that batches execution. After each batch, control
+        returns to the Qt event loop so paint events and timers can fire,
+        preventing UI starvation under heavy async I/O load.
+        """
+        queue = self._ready_queue
+        batch = self._ready_batch_size
+        executed = 0
+        while queue and executed < batch:
+            handle = queue.popleft()
+            handle._cb()
+            executed += 1
+        # Stop the timer if the queue is empty to avoid busy-spinning
+        if not queue:
+            self._ready_timer.stop()
+            # Idle moment — opportunistically run GC if enough time has passed
+            self._try_gc()
+
+    def _try_gc(self) -> None:
+        """Run GC gen0 collection if enough time has passed since last run.
+
+        By disabling auto-GC and running it during idle gaps, we prevent
+        GC pauses from interrupting rendering or I/O processing.
+        Only collects gen0 (fast) to minimize pause duration.
+        """
+        now = self._time_ns()
+        if now - self._gc_last_run_ns >= self._gc_interval_ns:
+            self._gc_last_run_ns = now
+            self._gc.collect(0)  # gen0 only — fast, ~0.1-1ms
 
     async def shutdown_asyncgens(self) -> None:
         if not len(self._asyncgens):
@@ -771,9 +850,40 @@ class QAsyncioEventLoop(asyncio.BaseEventLoop, QObject):
         return False
 
     def _notifier_cb(self, fd, registry):
+        if self._io_throttled:
+            return
+        now = self._time_ns()
+        # Reset cycle tracking if >2ms since last notifier (new event loop iteration)
+        if now - self._io_cycle_start_ns > 2_000_000:
+            self._io_cycle_start_ns = now
+            self._io_cycle_spent_ns = 0
+
         entry = registry.get(fd)
         if entry is not None:
             entry[1](*entry[2])
+
+        self._io_cycle_spent_ns += self._time_ns() - now
+
+        # Throttle if time budget exceeded
+        if self._io_cycle_spent_ns > self._io_time_budget_ns:
+            # Budget exceeded — temporarily disable all notifiers
+            self._io_throttled = True
+            for notifier, _, _ in self._readers.values():
+                notifier.setEnabled(False)
+            for notifier, _, _ in self._writers.values():
+                notifier.setEnabled(False)
+            self._io_resume_timer.start()
+
+    @Slot()
+    def _io_resume_notifiers(self) -> None:
+        """Re-enable socket notifiers after throttle pause."""
+        self._io_throttled = False
+        self._io_cycle_start_ns = self._time_ns()
+        self._io_cycle_spent_ns = 0
+        for notifier, _, _ in self._readers.values():
+            notifier.setEnabled(True)
+        for notifier, _, _ in self._writers.values():
+            notifier.setEnabled(True)
 
     def add_reader(self, fd, callback, *args):
         self._add_reader(fd, callback, *args)
@@ -1081,7 +1191,16 @@ class QAsyncioHandle:
         self._is_threadsafe = is_threadsafe
         self._timeout = 0
         self._state = QAsyncioHandle._PENDING
-        self._schedule_event(0)
+        if is_threadsafe:
+            # Threadsafe callbacks must go through QTimer.singleShot
+            # to marshal onto the correct thread.
+            self._schedule_event(0)
+        else:
+            # Non-threadsafe call_soon: enqueue into the ready queue
+            # instead of creating a QTimer per callback.
+            loop._ready_queue.append(self)
+            if not loop._ready_timer.isActive():
+                loop._ready_timer.start()
 
     def _schedule_event(self, timeout: int) -> None:
         # Do not schedule events from asyncio when the app is quit from outside
