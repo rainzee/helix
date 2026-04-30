@@ -10,6 +10,7 @@ from .events import (
     QAsyncioTimerHandle,
 )
 from .futures import QAsyncioFuture
+from .logging import _ENABLED as _PERF_ENABLED, _now_us, log_event, metrics
 from .tasks import QAsyncioTask
 
 __all__ = [
@@ -19,6 +20,7 @@ __all__ = [
     "QAsyncioTimerHandle",
     "QAsyncioFuture",
     "QAsyncioTask",
+    "metrics",
 ]
 
 
@@ -69,6 +71,16 @@ def run(
         QAsyncioEventLoopPolicy(quit_qapp=quit_qapp, handle_sigint=handle_sigint)
     )
 
+    if _PERF_ENABLED:
+        log_event(
+            "helix.run.start",
+            keep_running=keep_running,
+            quit_qapp=quit_qapp,
+            handle_sigint=handle_sigint,
+            debug=debug,
+        )
+        _run_start = _now_us()
+
     ret = None
     exc = None
 
@@ -86,6 +98,11 @@ def run(
             )
 
     asyncio.set_event_loop_policy(default_policy)
+
+    if _PERF_ENABLED:
+        _run_elapsed = _now_us() - _run_start  # type: ignore[possibly-undefined]
+        log_event("helix.run.end", elapsed_us=_run_elapsed)
+        metrics.log_summary()
 
     if ret:
         return ret

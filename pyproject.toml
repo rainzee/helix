@@ -7,7 +7,9 @@ authors = [
     { name = "rainzee", email = "rainzee.w@gmail.com" }
 ]
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "loguru>=0.7.3",
+]
 
 [build-system]
 requires = ["uv_build>=0.10.0,<0.11.0"]

@@ -6,6 +6,7 @@ import enum
 from typing import Any, Callable
 
 from . import events
+from .logging import _ENABLED as _PERF_ENABLED, log_event, metrics
 
 
 class QAsyncioFuture:
@@ -51,6 +52,9 @@ class QAsyncioFuture:
         # List of callbacks that are called when the future is done.
         self._callbacks: list[Callable] = []
 
+        if _PERF_ENABLED:
+            metrics.futures_created += 1
+
     def __await__(self):
         if not self.done():
             self._asyncio_future_blocking = True
@@ -90,11 +94,16 @@ class QAsyncioFuture:
         self._result = result
         self._state = QAsyncioFuture._STATE_DONE_WITH_RESULT
         self._schedule_callbacks()
+        if _PERF_ENABLED:
+            metrics.futures_resolved += 1
 
     def set_exception(self, exception: Exception) -> None:
         self._exception = exception
         self._state = QAsyncioFuture._STATE_DONE_WITH_EXCEPTION
         self._schedule_callbacks()
+        if _PERF_ENABLED:
+            metrics.futures_resolved += 1
+            log_event("future.exception", exception=type(exception).__name__)
 
     def done(self) -> bool:
         return self._state != QAsyncioFuture._STATE_PENDING
@@ -123,6 +132,8 @@ class QAsyncioFuture:
         self._state = QAsyncioFuture._STATE_CANCELLED
         self._cancel_message = msg
         self._schedule_callbacks()
+        if _PERF_ENABLED:
+            metrics.futures_cancelled += 1
         return True
 
     def exception(self) -> BaseException | None:

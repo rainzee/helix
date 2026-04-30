@@ -28,6 +28,7 @@ from PySide6.QtCore import (
 )
 
 from . import futures, tasks
+from .logging import _ENABLED as _PERF_ENABLED, _now_us, log_event, metrics, perf_logger
 
 __all__ = [
     "QAsyncioEventLoopPolicy",
@@ -249,6 +250,9 @@ class QAsyncioEventLoop(asyncio.BaseEventLoop, QObject):
 
         self._application.aboutToQuit.connect(self._about_to_quit_cb)
 
+        if _PERF_ENABLED:
+            log_event("event_loop.created", quit_qapp=quit_qapp)
+
     # Running and stopping the loop
 
     def _run_until_complete_cb(self, future: futures.QAsyncioFuture) -> None:
@@ -290,9 +294,16 @@ class QAsyncioEventLoop(asyncio.BaseEventLoop, QObject):
             raise RuntimeError("Event loop is closed")
         if self.is_running():
             raise RuntimeError("Event loop is already running")
+        if _PERF_ENABLED:
+            log_event("event_loop.run_forever.start")
+            _start = _now_us()
         asyncio.events._set_running_loop(self)
         self._application.exec()
         asyncio.events._set_running_loop(None)
+        if _PERF_ENABLED:
+            _elapsed = _now_us() - _start  # type: ignore[possibly-undefined]
+            log_event("event_loop.run_forever.stop", elapsed_us=_elapsed)
+            metrics.log_summary()
 
     def _about_to_quit_cb(self):
         """A callback for the aboutToQuit signal of the QCoreApplication."""
@@ -332,6 +343,8 @@ class QAsyncioEventLoop(asyncio.BaseEventLoop, QObject):
             raise RuntimeError("Cannot close a running event loop")
         if self.is_closed():
             return
+        if _PERF_ENABLED:
+            log_event("event_loop.close", readers=len(self._readers), writers=len(self._writers))
         for fd in list(self._readers):
             self._remove_reader(fd)
         for fd in list(self._writers):
@@ -398,6 +411,13 @@ class QAsyncioEventLoop(asyncio.BaseEventLoop, QObject):
         context: Context | None = None,
         is_threadsafe: bool | None = False,
     ) -> asyncio.Handle:
+        if _PERF_ENABLED:
+            metrics.callbacks_scheduled += 1
+            perf_logger.trace(
+                "callback.schedule | type=call_soon | cb={} | threadsafe={}",
+                getattr(callback, "__qualname__", callback),
+                is_threadsafe,
+            )
         # Short-circuit: for immediate callbacks, create a lightweight Handle
         # directly instead of going through the TimerHandle chain.
         return QAsyncioHandle(
@@ -468,6 +488,14 @@ class QAsyncioEventLoop(asyncio.BaseEventLoop, QObject):
         """All call_at() and call_later() methods map to this method."""
         if not isinstance(when, (int, float)):
             raise TypeError("when must be an int or float")
+        if _PERF_ENABLED:
+            metrics.callbacks_scheduled += 1
+            delay_ms = round(max(when - self.time(), 0) * 1000)
+            perf_logger.trace(
+                "callback.schedule | type=call_at | cb={} | delay_ms={}",
+                getattr(callback, "__qualname__", callback),
+                delay_ms,
+            )
         return QAsyncioTimerHandle(
             when, callback, args, self, context, is_threadsafe=is_threadsafe
         )
@@ -932,6 +960,14 @@ class QAsyncioEventLoop(asyncio.BaseEventLoop, QObject):
         if executor is None:
             executor = self._default_executor
 
+        if _PERF_ENABLED:
+            metrics.executor_dispatches += 1
+            log_event(
+                "executor.dispatch",
+                func=getattr(func, "__qualname__", func),
+                executor_type=type(executor).__name__,
+            )
+
         # Executors require a bit of extra work for QtAsyncio, as we can't use
         # naked Python threads; instead, we must make sure that the thread
         # created by executor.submit() has an event loop. This is achieved by
@@ -1071,12 +1107,23 @@ class QAsyncioHandle:
         """
         if self._state != QAsyncioHandle._PENDING:
             return
+        if _PERF_ENABLED:
+            _start = _now_us()
         ctx = self._context
         if ctx is not None:
             ctx.run(self._callback, *self._cb_args)
         else:
             self._callback(*self._cb_args)
         self._state = QAsyncioHandle._DONE
+        if _PERF_ENABLED:
+            _elapsed = _now_us() - _start  # type: ignore[possibly-undefined]
+            metrics.callbacks_executed += 1
+            metrics.total_callback_time_us += _elapsed
+            perf_logger.trace(
+                "callback.executed | cb={} | elapsed={}μs",
+                getattr(self._callback, "__qualname__", self._callback),
+                _elapsed,
+            )
 
     def cancel(self) -> None:
         if self._state == QAsyncioHandle._PENDING:

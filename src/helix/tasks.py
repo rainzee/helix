@@ -8,6 +8,7 @@ import traceback
 from typing import Any, Optional
 
 from . import events, futures
+from .logging import _ENABLED as _PERF_ENABLED, _now_us, log_event, metrics, perf_logger
 
 
 class QAsyncioTask(futures.QAsyncioFuture):
@@ -50,6 +51,14 @@ class QAsyncioTask(futures.QAsyncioFuture):
 
         # https://docs.python.org/3/library/asyncio-extending.html#task-lifetime-support
         asyncio._register_task(self)  # type: ignore[arg-type]
+
+        if _PERF_ENABLED:
+            metrics.tasks_created += 1
+            log_event(
+                "task.created",
+                name=self._name,
+                coro=getattr(coro, "__qualname__", type(coro).__name__),
+            )
 
     @property
     def _fut_waiter(self):
@@ -97,6 +106,11 @@ class QAsyncioTask(futures.QAsyncioFuture):
 
         if self._state != futures.QAsyncioFuture._STATE_PENDING:
             return
+
+        if _PERF_ENABLED:
+            _step_start = _now_us()
+            metrics.task_steps += 1
+
         result = None
         self._future_to_await = None
 
@@ -214,6 +228,23 @@ class QAsyncioTask(futures.QAsyncioFuture):
 
                 # https://docs.python.org/3/library/asyncio-extending.html#task-lifetime-support
                 asyncio._unregister_task(self)  # type: ignore[arg-type]
+
+                if _PERF_ENABLED:
+                    if self._state == futures.QAsyncioFuture._STATE_CANCELLED:
+                        metrics.tasks_cancelled += 1
+                        log_event("task.cancelled", name=self._name)
+                    else:
+                        metrics.tasks_completed += 1
+                        log_event("task.completed", name=self._name, state=self._state)
+
+            if _PERF_ENABLED:
+                _step_elapsed = _now_us() - _step_start  # type: ignore[possibly-undefined]
+                metrics.total_task_step_time_us += _step_elapsed
+                perf_logger.trace(
+                    "task.step | name={} | elapsed={}μs",
+                    self._name,
+                    _step_elapsed,
+                )
 
     def get_stack(self, *, limit=None) -> list[Any]:
         # TODO
