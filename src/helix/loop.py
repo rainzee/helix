@@ -18,6 +18,7 @@ from PySide6.QtCore import (
 if TYPE_CHECKING:
     from asyncio import TimerHandle
     from asyncio.events import Handle
+    from collections import deque
     from collections.abc import Callable
     from contextvars import Context
 
@@ -109,10 +110,11 @@ class QtEventLoop(SelectorEventLoop):
         Drain asyncio's internal queues. Called by QTimer at each
         Qt event loop iteration (interval=0).
         """
-        # 1. Move due scheduled callbacks to _ready
-        now = self.time()
-        scheduled = self._scheduled
-        ready = self._ready
+
+        now: float = self.time()
+        ready: "deque[Handle]" = self._ready  # type: ignore
+        scheduled: "list[TimerHandle]" = self._scheduled  # type: ignore
+
         while scheduled:
             handle = scheduled[0]
             if handle._when > now:
@@ -148,6 +150,8 @@ class QtEventLoop(SelectorEventLoop):
     def call_soon(
         self, callback: "Callable", *args, context: "Context | None" = None
     ) -> "Handle":
+        """Override Asyncio's event loop call_soon to ensure the pump timer is active."""
+
         handle = super().call_soon(callback, *args, context=context)
         if not self._timer.isActive():
             self._timer.setInterval(0)
@@ -161,6 +165,8 @@ class QtEventLoop(SelectorEventLoop):
         *args,
         context: "Context | None" = None,
     ) -> "Handle":
+        """Override Asyncio's event loop call_soon_threadsafe to ensure the pump timer is active."""
+
         return super().call_soon_threadsafe(callback, *args, context=context)
 
     @override
@@ -236,16 +242,17 @@ class QtEventLoop(SelectorEventLoop):
 
         return False
 
-    def _on_io_ready(self, fd, callback, args):
+    def _on_io_ready(self, fd: int, callback: "Callable", args) -> None:
         """Execute an I/O callback directly (not enqueued).
 
         QSocketNotifier is level-triggered: it fires as long as the fd
         is readable/writable. We must consume the data synchronously
         to prevent infinite re-firing.
         """
+
         callback(*args)
         # Ensure the pump runs to process any handles scheduled by the callback
-        if self._ready:
+        if self._ready:  # type: ignore
             self._timer.setInterval(0)
             if not self._timer.isActive():
                 self._timer.start()
