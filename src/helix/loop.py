@@ -162,35 +162,13 @@ class QtEventLoop(SelectorEventLoop):
         Qt event loop iteration (interval=0).
         """
 
-        now: float = self.time()
-        ready: "deque[Handle]" = self._ready  # type: ignore
-        scheduled: "list[TimerHandle]" = self._scheduled  # type: ignore
+        super()._run_once()  # type: ignore
 
-        while scheduled:
-            handle = scheduled[0]
-            if handle._when > now:
-                break
-
-            heapq.heappop(scheduled)
-            handle._scheduled = False
-
-            if not handle._cancelled:
-                ready.append(handle)
-
-        batch = self._batch_size
-        n = 0
-
-        while ready and n < batch:
-            handle = ready.popleft()
-            if not handle._cancelled:
-                handle._run()
-            n += 1
-
-        if ready:
+        if self._ready:  # type: ignore
             if self._timer.interval() != 0:
                 self._timer.setInterval(0)
-        elif scheduled:
-            delay_ms = max(1, int((scheduled[0]._when - self.time()) * 1000))
+        elif self._scheduled:  # type: ignore
+            delay_ms = max(1, int((self._scheduled[0]._when - self.time()) * 1000))  # type: ignore
             self._timer.setInterval(delay_ms)
         else:
             self._timer.stop()
