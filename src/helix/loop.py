@@ -1,13 +1,12 @@
-from __future__ import annotations
-
 import asyncio
 import asyncio.events
 import heapq
 import socket
 import sys
 import threading
+from asyncio import SelectorEventLoop
 from selectors import BaseSelector, SelectorKey
-from typing import override
+from typing import TYPE_CHECKING, override
 
 from PySide6.QtCore import (
     QCoreApplication,
@@ -15,6 +14,11 @@ from PySide6.QtCore import (
     QSocketNotifier,
     QTimer,
 )
+
+if TYPE_CHECKING:
+    from asyncio.events import Handle
+    from collections.abc import Callable
+    from contextvars import Context
 
 
 class PlaceholderSelector(BaseSelector):
@@ -37,7 +41,7 @@ class PlaceholderSelector(BaseSelector):
         return {}
 
 
-class QtEventLoop(asyncio.SelectorEventLoop):
+class QtEventLoop(SelectorEventLoop):
     """
     A thin Qt-backed asyncio event loop.
 
@@ -49,17 +53,11 @@ class QtEventLoop(asyncio.SelectorEventLoop):
     is preserved — we only replace the bottom-most scheduling layer.
     """
 
-    def __init__(self, app: QCoreApplication):
+    def __init__(self, app: QCoreApplication) -> None:
         self._app = app
-
-        # I/O tracking — must be initialized before super().__init__()
-        # because _make_self_pipe() calls _add_reader() during init.
         self._notifiers: dict[tuple, QSocketNotifier] = {}
-
-        # Batch size for ready queue drain per pump cycle
         self._batch_size = 64
 
-        # Use the null selector — I/O goes through QSocketNotifier
         super().__init__(selector=PlaceholderSelector())
 
         self._timer = QTimer()
@@ -70,22 +68,16 @@ class QtEventLoop(asyncio.SelectorEventLoop):
         self._thread_id: int | None = None
         self._qt_loop: QEventLoop | None = None
 
-    # ------------------------------------------------------------------
-    # Override: run_forever / stop
-    # ------------------------------------------------------------------
-
     def run_forever(self) -> None:
-        self._check_closed()
-        self._check_running()
-        self._set_coroutine_origin_tracking(self._debug)
+        self._check_closed()  # type: ignore
+        self._check_running()  # type: ignore
+        self._check_running()  # type: ignore
         self._thread_id = threading.get_ident()
-
         old_agen_hooks = sys.get_asyncgen_hooks()
+
         try:
             asyncio.events._set_running_loop(self)
             self._timer.start()
-            # Each run_forever() gets its own QEventLoop — supports
-            # nested run_until_complete calls during shutdown.
             qt_loop = QEventLoop(self._app)
             self._qt_loop = qt_loop
             qt_loop.exec()
@@ -94,14 +86,13 @@ class QtEventLoop(asyncio.SelectorEventLoop):
             self._timer.stop()
             self._thread_id = None
             asyncio.events._set_running_loop(None)
-            self._set_coroutine_origin_tracking(False)
+            self._set_coroutine_origin_tracking(False)  # type: ignore
             sys.set_asyncgen_hooks(*old_agen_hooks)
 
     def stop(self) -> None:
-        """Stop the event loop. Safe to call from callbacks."""
         self.call_soon(self._do_stop)
 
-    def _do_stop(self):
+    def _do_stop(self) -> None:
         if self._qt_loop is not None:
             self._qt_loop.quit()
 
@@ -152,23 +143,24 @@ class QtEventLoop(asyncio.SelectorEventLoop):
             # Nothing to do — stop the timer, will restart on call_soon
             self._timer.stop()
 
-    # ------------------------------------------------------------------
-    # Override call_soon to ensure the pump timer is running
-    # ------------------------------------------------------------------
-
-    def call_soon(self, callback, *args, context=None):
+    @override
+    def call_soon(
+        self, callback: "Callable", *args, context: "Context | None" = None
+    ) -> "Handle":
         handle = super().call_soon(callback, *args, context=context)
         if not self._timer.isActive():
             self._timer.setInterval(0)
             self._timer.start()
         return handle
 
-    def call_soon_threadsafe(self, callback, *args, context=None):
-        handle = super().call_soon_threadsafe(callback, *args, context=context)
-        # super() already writes to self-pipe which triggers our QSocketNotifier
-        # for the self-pipe reader fd — that will restart the pump timer via
-        # _on_io_ready. No additional wakeup needed.
-        return handle
+    @override
+    def call_soon_threadsafe(
+        self,
+        callback: "Callable",
+        *args,
+        context: "Context | None" = None,
+    ) -> "Handle":
+        return super().call_soon_threadsafe(callback, *args, context=context)
 
     def call_later(self, delay, callback, *args, context=None):
         handle = super().call_later(delay, callback, *args, context=context)
