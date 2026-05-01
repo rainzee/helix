@@ -1,6 +1,6 @@
 [project]
 name = "helix"
-version = "0.1.0"
+version = "0.2.0"
 description = "Qt Asyncio done right"
 readme = "README.md"
 authors = [
