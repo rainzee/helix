@@ -1,11 +1,10 @@
-import asyncio
-import asyncio.events
 import heapq
-import socket
 import sys
 import threading
 from asyncio import SelectorEventLoop
+from asyncio.events import _set_running_loop
 from selectors import BaseSelector, SelectorKey
+from socket import socket
 from typing import TYPE_CHECKING, override
 
 from PySide6.QtCore import (
@@ -70,6 +69,7 @@ class QtEventLoop(SelectorEventLoop):
         self._thread_id: int | None = None
         self._qt_loop: QEventLoop | None = None
 
+    @override
     def run_forever(self) -> None:
         self._check_closed()  # type: ignore
         self._check_running()  # type: ignore
@@ -78,7 +78,7 @@ class QtEventLoop(SelectorEventLoop):
         old_agen_hooks = sys.get_asyncgen_hooks()
 
         try:
-            asyncio.events._set_running_loop(self)
+            _set_running_loop(self)
             self._timer.start()
             qt_loop = QEventLoop(self._app)
             self._qt_loop = qt_loop
@@ -87,64 +87,13 @@ class QtEventLoop(SelectorEventLoop):
             self._qt_loop = None
             self._timer.stop()
             self._thread_id = None
-            asyncio.events._set_running_loop(None)
+            _set_running_loop(None)
             self._set_coroutine_origin_tracking(False)  # type: ignore
             sys.set_asyncgen_hooks(*old_agen_hooks)
 
-    def stop(self) -> None:
-        self.call_soon(self._do_stop)
-
-    def _do_stop(self) -> None:
-        if self._qt_loop is not None:
-            self._qt_loop.quit()
-
+    @override
     def is_running(self) -> bool:
         return self._thread_id is not None
-
-    # ------------------------------------------------------------------
-    # The pump: bridges Qt's event dispatch into asyncio's scheduling
-    # ------------------------------------------------------------------
-
-    def _pump(self) -> None:
-        """
-        Drain asyncio's internal queues. Called by QTimer at each
-        Qt event loop iteration (interval=0).
-        """
-
-        now: float = self.time()
-        ready: "deque[Handle]" = self._ready  # type: ignore
-        scheduled: "list[TimerHandle]" = self._scheduled  # type: ignore
-
-        while scheduled:
-            handle = scheduled[0]
-            if handle._when > now:
-                break
-            heapq.heappop(scheduled)
-            handle._scheduled = False
-            if not handle._cancelled:
-                ready.append(handle)
-
-        # 2. Execute ready callbacks in batches
-        batch = self._batch_size
-        n = 0
-        while ready and n < batch:
-            handle = ready.popleft()
-            if not handle._cancelled:
-                handle._run()
-            n += 1
-
-        # 3. Adjust timer based on queue state
-        if ready:
-            # More work pending — keep timer at 0 (immediate)
-            if self._timer.interval() != 0:
-                self._timer.setInterval(0)
-        elif scheduled:
-            # Sleep until next scheduled callback
-            delay_ms = max(1, int((scheduled[0]._when - self.time()) * 1000))
-            self._timer.setInterval(delay_ms)
-        else:
-            # Nothing to do — stop the timer, will restart on call_soon
-            self._timer.stop()
 
     @override
     def call_soon(
@@ -186,10 +135,74 @@ class QtEventLoop(SelectorEventLoop):
             self._timer.start()
         return handle
 
+    @override
+    def stop(self) -> None:
+        self.call_soon(self._do_stop)
+
+    @override
+    def close(self) -> None:
+
+        if self.is_running():
+            raise RuntimeError("Cannot close a running event loop")
+
+        if self.is_closed():
+            return
+
+        self._timer.stop()
+
+        for notifier in self._notifiers.values():
+            notifier.setEnabled(False)
+
+        self._notifiers.clear()
+        super().close()
+
+    def _pump(self) -> None:
+        """
+        Drain asyncio's internal queues. Called by QTimer at each
+        Qt event loop iteration (interval=0).
+        """
+
+        now: float = self.time()
+        ready: "deque[Handle]" = self._ready  # type: ignore
+        scheduled: "list[TimerHandle]" = self._scheduled  # type: ignore
+
+        while scheduled:
+            handle = scheduled[0]
+            if handle._when > now:
+                break
+
+            heapq.heappop(scheduled)
+            handle._scheduled = False
+
+            if not handle._cancelled:
+                ready.append(handle)
+
+        batch = self._batch_size
+        n = 0
+
+        while ready and n < batch:
+            handle = ready.popleft()
+            if not handle._cancelled:
+                handle._run()
+            n += 1
+
+        if ready:
+            if self._timer.interval() != 0:
+                self._timer.setInterval(0)
+        elif scheduled:
+            delay_ms = max(1, int((scheduled[0]._when - self.time()) * 1000))
+            self._timer.setInterval(delay_ms)
+        else:
+            self._timer.stop()
+
+    def _do_stop(self) -> None:
+        if self._qt_loop is not None:
+            self._qt_loop.quit()
+
     def _add_reader(self, fd: int, callback: "Callable", *args) -> None:
         """Add a file descriptor for read events using QSocketNotifier."""
 
-        if isinstance(fd, socket.socket):
+        if isinstance(fd, socket):
             fd = fd.fileno()
 
         self._remove_reader(fd)
@@ -201,7 +214,7 @@ class QtEventLoop(SelectorEventLoop):
     def _remove_reader(self, fd: int) -> bool:
         """Remove a file descriptor from read events."""
 
-        if isinstance(fd, socket.socket):
+        if isinstance(fd, socket):
             fd = fd.fileno()
 
         key = ("r", fd)
@@ -217,7 +230,7 @@ class QtEventLoop(SelectorEventLoop):
     def _add_writer(self, fd: int, callback: "Callable", *args) -> None:
         """Add a file descriptor for write events using QSocketNotifier."""
 
-        if isinstance(fd, socket.socket):
+        if isinstance(fd, socket):
             fd = fd.fileno()
 
         self._remove_writer(fd)
@@ -229,7 +242,7 @@ class QtEventLoop(SelectorEventLoop):
     def _remove_writer(self, fd: int) -> bool:
         """Remove a file descriptor from write events."""
 
-        if isinstance(fd, socket.socket):
+        if isinstance(fd, socket):
             fd = fd.fileno()
 
         key = ("w", fd)
@@ -256,20 +269,3 @@ class QtEventLoop(SelectorEventLoop):
             self._timer.setInterval(0)
             if not self._timer.isActive():
                 self._timer.start()
-
-    @override
-    def close(self) -> None:
-
-        if self.is_running():
-            raise RuntimeError("Cannot close a running event loop")
-
-        if self.is_closed():
-            return
-
-        self._timer.stop()
-
-        for notifier in self._notifiers.values():
-            notifier.setEnabled(False)
-
-        self._notifiers.clear()
-        super().close()
