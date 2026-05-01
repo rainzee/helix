@@ -1,32 +1,20 @@
-"""
-Shared UI module for Helix performance tests.
-
-Provides a reusable test harness with:
-- An expanding/rotating triangle rendered via QPainter
-- A QTextEdit log panel
-- Real-time FPS display in the window title
-- Auto-close after a configurable duration
-
-Usage:
-    from test_ui import PerfTestWindow, run_test
-
-    async def my_test(window: PerfTestWindow):
-        window.log("doing stuff...")
-        await asyncio.sleep(1)
-
-    if __name__ == "__main__":
-        run_test(my_test, duration=5.0, title="My Test")
-"""
-
-from __future__ import annotations
-
 import asyncio
 import math
 import sys
 import time
 from typing import Awaitable, Callable
 
-from PySide6.QtCore import QElapsedTimer, QPointF, QTimer, Qt
+from PySide6.QtCore import (
+    Property,
+    QAbstractAnimation,
+    QEasingCurve,
+    QElapsedTimer,
+    QPointF,
+    QPropertyAnimation,
+    QSequentialAnimationGroup,
+    Qt,
+    QTimer,
+)
 from PySide6.QtGui import QBrush, QColor, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import (
     QApplication,
@@ -43,50 +31,89 @@ TestCoroutine = Callable[["PerfTestWindow"], Awaitable[None]]
 
 
 class TriangleWidget(QWidget):
-    """
-    A widget that renders a continuously expanding and rotating triangle.
-    Serves as a visual indicator that the event loop is running smoothly.
-    """
+    """A widget that renders a continuously rotating and scaling"""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._elapsed = QElapsedTimer()
-        self._elapsed.start()
-        self._frame_count = 0
-        self._fps = 0.0
-        self._last_fps_time = time.perf_counter()
-        self._base_size = 20.0
-        self._max_size = 150.0
-        self._growth_rate = 15.0
-        self._rotation_speed = 90.0
-        self.setMinimumHeight(200)
+        self.fps = 0.0
+        self.frame_count = 0
+        self.last_fps_time = time.perf_counter()
+        self.elapsed = QElapsedTimer()
+        self.elapsed.start()
+        self.angle_value = 0.0
+        self.scale_value = 20.0
+        self.setup_animations()
 
-    @property
-    def fps(self) -> float:
-        return self._fps
+    def get_angle(self) -> float:
+        return self.angle_value
 
-    @property
-    def frame_count(self) -> int:
-        return self._frame_count
+    def set_angle(self, value: float) -> None:
+        self.angle_value = value
+        self.update()
+
+    def get_scale(self) -> float:
+        return self.scale_value
+
+    def set_scale(self, value: float) -> None:
+        self.scale_value = value
+        self.update()
+
+
+    def setup_animations(self) -> None:
+        # Rotation: continuous 0 -> 360 over 4 seconds, looping forever
+        self.rotation_anim = QPropertyAnimation(self, b"angle")
+        self.rotation_anim.setDuration(4000)
+        self.rotation_anim.setStartValue(0.0)
+        self.rotation_anim.setEndValue(360.0)
+        self.rotation_anim.setLoopCount(-1)
+        self.rotation_anim.setEasingCurve(QEasingCurve.Type.Linear)
+        self.rotation_anim.start()
+
+        # Scale: ping-pong between 20 and 150 using a sequential group
+        self.scale_group = QSequentialAnimationGroup(self)
+
+        grow = QPropertyAnimation(self, b"scale")
+        grow.setDuration(5000)
+        grow.setStartValue(20.0)
+        grow.setEndValue(150.0)
+        grow.setEasingCurve(QEasingCurve.Type.InOutSine)
+
+        shrink = QPropertyAnimation(self, b"scale")
+        shrink.setDuration(5000)
+        shrink.setStartValue(150.0)
+        shrink.setEndValue(20.0)
+        shrink.setEasingCurve(QEasingCurve.Type.InOutSine)
+
+        self.scale_group.addAnimation(grow)
+        self.scale_group.addAnimation(shrink)
+        self.scale_group.setLoopCount(-1)
+        self.scale_group.start()
+
+        # Direction: toggle rotation direction every 6 seconds
+        self.direction_timer = QTimer(self)
+        self.direction_timer.setInterval(6000)
+        self.direction_timer.timeout.connect(self.toggle_direction)
+        self.direction_timer.start()
+
+    def toggle_direction(self) -> None:
+        """Toggle rotation direction using Qt's native Direction enum."""
+        if self.rotation_anim.direction() == QAbstractAnimation.Direction.Forward:
+            self.rotation_anim.setDirection(QAbstractAnimation.Direction.Backward)
+        else:
+            self.rotation_anim.setDirection(QAbstractAnimation.Direction.Forward)
 
     def paintEvent(self, event) -> None:  # noqa: N802
-        self._frame_count += 1
+        self.frame_count += 1
         now = time.perf_counter()
-        dt = now - self._last_fps_time
+        dt = now - self.last_fps_time
         if dt >= 1.0:
-            self._fps = self._frame_count / dt if dt > 0 else 0
-            self._frame_count = 0
-            self._last_fps_time = now
+            self.fps = self.frame_count / dt if dt > 0 else 0
+            self.frame_count = 0
+            self.last_fps_time = now
 
-        elapsed_sec = self._elapsed.elapsed() / 1000.0
-
-        # Expanding size (10-second cycle)
-        cycle = elapsed_sec % 10.0
-        size = self._base_size + self._growth_rate * cycle
-        size = min(size, self._max_size)
-
-        # Rotation
-        angle_rad = math.radians(elapsed_sec * self._rotation_speed)
+        elapsed_sec = self.elapsed.elapsed() / 1000.0
+        angle_rad = math.radians(self.angle_value)
+        size = self.scale_value
 
         cx = self.width() / 2.0
         cy = self.height() / 2.0
@@ -107,6 +134,9 @@ class TriangleWidget(QWidget):
         painter.drawPolygon(points)
         painter.end()
 
+    scale = Property(float, get_scale, set_scale)
+    angle = Property(float, get_angle, set_angle)
+
 
 class PerfTestWindow(QWidget):
     """
@@ -120,9 +150,9 @@ class PerfTestWindow(QWidget):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        self._duration = duration
-        self._start_time = time.perf_counter()
-        self._closed = False
+        self.duration = duration
+        self.start_time = time.perf_counter()
+        self.closed = False
 
         self.setWindowTitle(title)
         self.resize(600, 500)
@@ -133,58 +163,52 @@ class PerfTestWindow(QWidget):
         splitter = QSplitter()
         splitter.setOrientation(Qt.Orientation.Vertical)
 
-        self._triangle = TriangleWidget()
-        splitter.addWidget(self._triangle)
+        self.triangle = TriangleWidget()
+        splitter.addWidget(self.triangle)
 
-        self._log_edit = QTextEdit()
-        self._log_edit.setReadOnly(True)
-        self._log_edit.setStyleSheet(
+        self.log_edit = QTextEdit()
+        self.log_edit.setReadOnly(True)
+        self.log_edit.setStyleSheet(
             "QTextEdit { background: #1e1e1e; color: #d4d4d4; "
             "font-family: Consolas, monospace; font-size: 10pt; }"
         )
-        splitter.addWidget(self._log_edit)
+        splitter.addWidget(self.log_edit)
 
         splitter.setSizes([200, 300])
         layout.addWidget(splitter)
 
         # Refresh timer drives animation and title updates (~60 FPS)
-        self._refresh_timer = QTimer(self)
-        self._refresh_timer.setInterval(16)
-        self._refresh_timer.timeout.connect(self._on_refresh)
-        self._refresh_timer.start()
-
-    @property
-    def triangle(self) -> TriangleWidget:
-        return self._triangle
+        self.refresh_timer = QTimer(self)
+        self.refresh_timer.setInterval(16)
+        self.refresh_timer.timeout.connect(self.on_refresh)
+        self.refresh_timer.start()
 
     def log(self, message: str) -> None:
         """Append a message to the log panel."""
-        self._log_edit.append(message)
-        sb = self._log_edit.verticalScrollBar()
+        self.log_edit.append(message)
+        sb = self.log_edit.verticalScrollBar()
         sb.setValue(sb.maximum())
 
-    def _on_refresh(self) -> None:
-        self._triangle.update()
+    def on_refresh(self) -> None:
+        self.triangle.update()
 
-        elapsed = time.perf_counter() - self._start_time
-        remaining = max(0, self._duration - elapsed)
-        fps = self._triangle.fps
+        elapsed = time.perf_counter() - self.start_time
+        remaining = max(0, self.duration - elapsed)
+        fps = self.triangle.fps
 
-        self.setWindowTitle(
-            f"FPS: {fps:.1f} | Remaining: {remaining:.1f}s"
-        )
+        self.setWindowTitle(f"FPS: {fps:.1f} | Remaining: {remaining:.1f}s")
 
         # Auto-close
-        if elapsed >= self._duration and not self._closed:
-            self._closed = True
-            self.log(f"[AUTO-CLOSE] Duration ({self._duration}s) reached. FPS={fps:.1f}")
-            self._refresh_timer.stop()
+        if elapsed >= self.duration and not self.closed:
+            self.closed = True
+            self.log(f"[AUTO-CLOSE] Duration ({self.duration}s) reached. FPS={fps:.1f}")
+            self.refresh_timer.stop()
             loop = asyncio.get_event_loop()
             loop.stop()
 
     def closeEvent(self, event) -> None:  # noqa: N802
-        self._closed = True
-        self._refresh_timer.stop()
+        self.closed = True
+        self.refresh_timer.stop()
         event.accept()
 
 
@@ -207,7 +231,7 @@ def run_test(
     window = PerfTestWindow(title=title, duration=duration)
     window.show()
 
-    async def _main():
+    async def main():
         window.log(f"[START] {title} | Duration: {duration}s")
         try:
             await test_coro(window)
@@ -216,4 +240,4 @@ def run_test(
         except Exception as e:
             window.log(f"[ERROR] {type(e).__name__}: {e}")
 
-    helix.run(_main(), keep_running=True, app=app, quit_qapp=True)
+    helix.run(main(), keep_running=True, app=app, quit_qapp=True)
