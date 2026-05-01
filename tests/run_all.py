@@ -1,9 +1,6 @@
 """
 Run all performance tests sequentially.
 
-Each test opens a window with the animated triangle and log panel,
-runs for its configured duration, then auto-closes.
-
 Usage:
     python tests/run_all.py
 """
@@ -24,7 +21,7 @@ TEST_FILES = [
 
 def main():
     print("=" * 60)
-    print("Helix Performance Test Suite")
+    print("Helix Test Suite")
     print("=" * 60)
 
     for test_file in TEST_FILES:
@@ -33,17 +30,10 @@ def main():
         print(f"Running: {test_file}")
         print(f"{'─' * 60}")
 
-        result = subprocess.run(
-            [sys.executable, str(path)],
-            env={
-                **__import__("os").environ,
-                "HELIX_PERF_LOG": "1",
-                "HELIX_PERF_LOG_LEVEL": "DEBUG",
-            },
-        )
+        result = subprocess.run([sys.executable, str(path)])
 
         if result.returncode != 0:
-            print(f"  [FAIL] {test_file} exited with code {result.returncode}")
+            print(f"  [FAIL] {test_file} (exit code {result.returncode})")
         else:
             print(f"  [PASS] {test_file}")
 

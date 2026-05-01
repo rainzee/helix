@@ -1,110 +1,86 @@
-from __future__ import annotations
-
 import asyncio
 from typing import Any, Coroutine
 
-from .events import (
-    QAsyncioEventLoop,
-    QAsyncioEventLoopPolicy,
-    QAsyncioHandle,
-    QAsyncioTimerHandle,
-)
-from .futures import QAsyncioFuture
-from .logging import _ENABLED as _PERF_ENABLED, _now_us, log_event, metrics
-from .tasks import QAsyncioTask
+from PySide6.QtCore import QCoreApplication
 
-__all__ = [
-    "QAsyncioEventLoopPolicy",
-    "QAsyncioEventLoop",
-    "QAsyncioHandle",
-    "QAsyncioTimerHandle",
-    "QAsyncioFuture",
-    "QAsyncioTask",
-    "metrics",
-]
+from .loop import QtEventLoop
+
+__all__ = ["run", "QtEventLoop"]
 
 
 def run(
     coro: Coroutine | None = None,
-    keep_running: bool = True,
-    quit_qapp: bool = True,
     *,
-    handle_sigint: bool = False,
-    debug: bool | None = None,
+    keep_running: bool = True,
+    app: QCoreApplication,
+    quit_qapp: bool = True,
 ) -> Any:
     """
-    Run the QtAsyncio event loop.
+    Run an async coroutine on a Qt-backed event loop.
 
-    If there is no instance of a QCoreApplication, QGuiApplication or
-    QApplication yet, a new instance of QCoreApplication is created.
+    Args:
+        coro:         The coroutine to run. Optional if keep_running=True.
+        keep_running: If True, the loop keeps running after the coro finishes
+                      (useful for GUI apps). If False, stops when coro completes.
+        app:          The QApplication instance (required).
+        quit_qapp:    If True, quit the QApplication when the loop stops.
 
-    :param coro:            The coroutine to run. Optional if keep_running is
-                            True.
-    :param keep_running:    If True, QtAsyncio (the asyncio event loop) will
-                            continue running after the coroutine finished, or
-                            run "forever" if no coroutine was provided.
-                            If False, QtAsyncio will stop after the
-                            coroutine finished. A coroutine must be provided if
-                            this argument is set to False.
-    :param quit_qapp:       If True, the QCoreApplication will quit when
-                            QtAsyncio (the asyncio event loop) stops.
-                            If False, the QCoreApplication will remain active
-                            after QtAsyncio stops, and can continue to be used.
-    :param handle_sigint:   If True, the SIGINT signal will be handled by the
-                            event loop, causing it to stop.
-    :param debug:           If True, the event loop will run in debug mode.
-                            If False, the event loop will run in normal mode.
-                            If None, the default behavior is used.
+    Returns:
+        The coroutine's return value (if keep_running=False and coro provided).
+
+    Example:
+        from PySide6.QtWidgets import QApplication
+
+        app = QApplication([])
+
+        # GUI app — loop keeps running until window is closed
+        helix.run(app=app)
+
+        # Run a coroutine and get its result
+        result = helix.run(fetch_data(), app=app, keep_running=False)
     """
 
-    # Event loop policies are expected to be deprecated with Python 3.13, with
-    # subsequent removal in Python 3.15. At that point, part of the current
-    # logic of the QAsyncioEventLoopPolicy constructor will have to be moved
-    # here and/or to a loop factory class (to be provided as an argument to
-    # asyncio.run()). In particular, this concerns the logic of setting up the
-    # QCoreApplication and the SIGINT handler.
-    #
-    # More details:
-    # https://discuss.python.org/t/removing-the-asyncio-policy-system-asyncio-set-event-loop-policy-in-python-3-15/37553  # noqa: E501
-    default_policy = asyncio.get_event_loop_policy()
-    asyncio.set_event_loop_policy(
-        QAsyncioEventLoopPolicy(quit_qapp=quit_qapp, handle_sigint=handle_sigint)
-    )
+    loop = QtEventLoop(app)
 
-    if _PERF_ENABLED:
-        log_event(
-            "helix.run.start",
-            keep_running=keep_running,
-            quit_qapp=quit_qapp,
-            handle_sigint=handle_sigint,
-            debug=debug,
-        )
-        _run_start = _now_us()
+    asyncio.set_event_loop(loop)
 
-    ret = None
-    exc = None
-
-    if keep_running:
-        if coro:
-            asyncio.ensure_future(coro)
-        asyncio.get_event_loop().run_forever()
-    else:
-        if coro:
-            ret = asyncio.run(coro, debug=debug)
+    try:
+        if keep_running:
+            if coro is not None:
+                loop.create_task(coro)
+            loop.run_forever()
+            return None
         else:
-            exc = RuntimeError(
-                "QtAsyncio was set not to keep running after the coroutine "
-                "finished, but no coroutine was provided."
+            if coro is None:
+                raise RuntimeError("A coroutine is required when keep_running=False")
+            return loop.run_until_complete(coro)
+    finally:
+        try:
+            _cancel_all_tasks(loop)
+            loop.run_until_complete(loop.shutdown_asyncgens())
+            loop.run_until_complete(loop.shutdown_default_executor())
+        finally:
+            asyncio.set_event_loop(None)
+            loop.close()
+            if quit_qapp:
+                app.quit()
+
+
+def _cancel_all_tasks(loop: asyncio.AbstractEventLoop) -> None:
+    to_cancel = asyncio.all_tasks(loop)
+    if not to_cancel:
+        return
+    for task in to_cancel:
+        task.cancel()
+    loop.run_until_complete(asyncio.gather(*to_cancel, return_exceptions=True))
+    for task in to_cancel:
+        if task.cancelled():
+            continue
+        if task.exception() is not None:
+            loop.call_exception_handler(
+                {
+                    "message": "unhandled exception during shutdown",
+                    "exception": task.exception(),
+                    "task": task,
+                }
             )
-
-    asyncio.set_event_loop_policy(default_policy)
-
-    if _PERF_ENABLED:
-        _run_elapsed = _now_us() - _run_start  # type: ignore[possibly-undefined]
-        log_event("helix.run.end", elapsed_us=_run_elapsed)
-        metrics.log_summary()
-
-    if ret:
-        return ret
-    if exc:
-        raise exc

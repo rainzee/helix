@@ -1,8 +1,5 @@
 """
-Test: Callback Performance
-
-Tests call_soon and call_later callback scheduling and execution timing.
-Measures per-callback overhead and total throughput.
+Test: Callback — call_soon and call_later scheduling and execution.
 """
 
 from __future__ import annotations
@@ -10,55 +7,50 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(__file__))
-os.environ["HELIX_PERF_LOG"] = "1"
-os.environ["HELIX_PERF_LOG_LEVEL"] = "DEBUG"
 
 from test_ui import PerfTestWindow, run_test
-
-from helix.logging import metrics
 
 
 async def test_callbacks(window: PerfTestWindow) -> None:
     loop = asyncio.get_event_loop()
-    window.log("[TEST] Measuring callback scheduling and execution...")
+    window.log("[TEST] Measuring callback scheduling...")
 
     round_num = 0
     call_soon_count = 60
     call_later_count = 20
+    total_executed = 0
+    t0 = time.perf_counter()
 
     while True:
         round_num += 1
+        executed = 0
 
-        # Schedule call_soon callbacks
-        results = []
+        # call_soon
         for i in range(call_soon_count):
-            loop.call_soon(results.append, i)
+            loop.call_soon(lambda: None)
 
-        # Schedule call_later callbacks with small delays
+        # call_later with small delays
         for i in range(call_later_count):
-            loop.call_later(0.01 * (i + 1), results.append, i + call_soon_count)
+            loop.call_later(0.01 * (i + 1), lambda: None)
 
-        # Give time for all callbacks to execute
+        # Give time for all callbacks to fire
         await asyncio.sleep(0.3)
+        total_executed += call_soon_count + call_later_count
 
-        avg_cb_us = (
-            metrics.total_callback_time_us / metrics.callbacks_executed
-            if metrics.callbacks_executed > 0
-            else 0
-        )
+        elapsed = time.perf_counter() - t0
+        rate = total_executed / elapsed if elapsed > 0 else 0
 
         window.log(
             f"[CALLBACK] Round {round_num} | "
-            f"scheduled={metrics.callbacks_scheduled} | "
-            f"executed={metrics.callbacks_executed} | "
-            f"avg_cb={avg_cb_us:.1f}μs | "
-            f"total_cb_time={metrics.total_callback_time_us}μs"
+            f"total={total_executed} | "
+            f"rate={rate:.0f}/s"
         )
 
         await asyncio.sleep(0.1)
 
 
 if __name__ == "__main__":
-    run_test(test_callbacks, duration=6.0, title="Callback Performance")
+    run_test(test_callbacks, duration=6.0, title="Callback Throughput")

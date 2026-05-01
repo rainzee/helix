@@ -1,8 +1,6 @@
 """
-Test: Executor Performance
-
-Tests run_in_executor dispatch — measures overhead of wrapping synchronous
-functions into the QAsyncioExecutorWrapper and thread pool submission.
+Test: Executor — run_in_executor dispatch.
+Verifies blocking work can be offloaded to threads without blocking the loop.
 """
 
 from __future__ import annotations
@@ -14,12 +12,8 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(__file__))
-os.environ["HELIX_PERF_LOG"] = "1"
-os.environ["HELIX_PERF_LOG_LEVEL"] = "DEBUG"
 
 from test_ui import PerfTestWindow, run_test
-
-from helix.logging import metrics
 
 
 def _blocking_work(n: int) -> float:
@@ -36,28 +30,34 @@ async def test_executor(window: PerfTestWindow) -> None:
 
     round_num = 0
     dispatches_per_round = 5
+    total_dispatched = 0
+    t0 = time.perf_counter()
 
     while True:
         round_num += 1
 
         start = time.perf_counter()
-        futs = []
-        for i in range(dispatches_per_round):
-            fut = loop.run_in_executor(None, _blocking_work, 5000 + i * 1000)
-            futs.append(fut)
+        futs = [
+            loop.run_in_executor(None, _blocking_work, 5000 + i * 1000)
+            for i in range(dispatches_per_round)
+        ]
 
         results = await asyncio.gather(*futs)
         elapsed_ms = (time.perf_counter() - start) * 1000
+        total_dispatched += dispatches_per_round
+
+        total_elapsed = time.perf_counter() - t0
+        rate = total_dispatched / total_elapsed if total_elapsed > 0 else 0
 
         window.log(
             f"[EXECUTOR] Round {round_num} | "
-            f"dispatches={metrics.executor_dispatches} | "
-            f"round_time={elapsed_ms:.1f}ms | "
-            f"results={[f'{r:.2f}' for r in results]}"
+            f"time={elapsed_ms:.1f}ms | "
+            f"total={total_dispatched} | "
+            f"rate={rate:.1f}/s"
         )
 
         await asyncio.sleep(0.2)
 
 
 if __name__ == "__main__":
-    run_test(test_executor, duration=6.0, title="Executor Performance")
+    run_test(test_executor, duration=6.0, title="Executor Throughput")
