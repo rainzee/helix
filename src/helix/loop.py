@@ -1,8 +1,6 @@
 import subprocess
 import sys
-import threading
 from asyncio import SelectorEventLoop, SubprocessTransport
-from asyncio.events import _set_running_loop
 from asyncio.transports import ReadTransport, WriteTransport
 from selectors import BaseSelector, SelectorKey
 from socket import socket
@@ -280,14 +278,9 @@ class QtEventLoop(SelectorEventLoop):
 
     @override
     def run_forever(self) -> None:
-        self._check_closed()  # type: ignore
-        self._check_running()  # type: ignore
-        self._check_running()  # type: ignore
-        self._thread_id = threading.get_ident()
-        old_agen_hooks = sys.get_asyncgen_hooks()
+        self._run_forever_setup()  # type: ignore
 
         try:
-            _set_running_loop(self)
             self._timer.start()
             qt_loop = QEventLoop(self._app)
             self._qt_loop = qt_loop
@@ -295,10 +288,7 @@ class QtEventLoop(SelectorEventLoop):
         finally:
             self._qt_loop = None
             self._timer.stop()
-            self._thread_id = None
-            _set_running_loop(None)
-            self._set_coroutine_origin_tracking(False)  # type: ignore
-            sys.set_asyncgen_hooks(*old_agen_hooks)
+            self._run_forever_cleanup()  # type: ignore
 
     @override
     def call_soon(
