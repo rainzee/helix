@@ -16,6 +16,7 @@ from PySide6.QtCore import (
 )
 
 if TYPE_CHECKING:
+    from asyncio import TimerHandle
     from asyncio.events import Handle
     from collections.abc import Callable
     from contextvars import Context
@@ -162,7 +163,16 @@ class QtEventLoop(SelectorEventLoop):
     ) -> "Handle":
         return super().call_soon_threadsafe(callback, *args, context=context)
 
-    def call_later(self, delay, callback, *args, context=None):
+    @override
+    def call_later(
+        self,
+        delay: float,
+        callback: "Callable",
+        *args,
+        context: "Context | None" = None,
+    ) -> "TimerHandle":
+        """Override Asyncio's event loop call_later to ensure the pump timer is active."""
+
         handle = super().call_later(delay, callback, *args, context=context)
         if not self._timer.isActive():
             delay_ms = max(1, int(delay * 1000))
@@ -170,48 +180,60 @@ class QtEventLoop(SelectorEventLoop):
             self._timer.start()
         return handle
 
-    # ------------------------------------------------------------------
-    # I/O: QSocketNotifier replaces selector.select()
-    # ------------------------------------------------------------------
+    def _add_reader(self, fd: int, callback: "Callable", *args) -> None:
+        """Add a file descriptor for read events using QSocketNotifier."""
 
-    def _add_reader(self, fd, callback, *args):
         if isinstance(fd, socket.socket):
             fd = fd.fileno()
+
         self._remove_reader(fd)
         notifier = QSocketNotifier(fd, QSocketNotifier.Type.Read)
         notifier.activated.connect(lambda: self._on_io_ready(fd, callback, args))
         notifier.setEnabled(True)
         self._notifiers[("r", fd)] = notifier
 
-    def _remove_reader(self, fd):
+    def _remove_reader(self, fd: int) -> bool:
+        """Remove a file descriptor from read events."""
+
         if isinstance(fd, socket.socket):
             fd = fd.fileno()
+
         key = ("r", fd)
         notifier = self._notifiers.pop(key, None)
+
         if notifier is not None:
             notifier.setEnabled(False)
             notifier.deleteLater()
             return True
+
         return False
 
-    def _add_writer(self, fd, callback, *args):
+    def _add_writer(self, fd: int, callback: "Callable", *args) -> None:
+        """Add a file descriptor for write events using QSocketNotifier."""
+
         if isinstance(fd, socket.socket):
             fd = fd.fileno()
+
         self._remove_writer(fd)
         notifier = QSocketNotifier(fd, QSocketNotifier.Type.Write)
         notifier.activated.connect(lambda: self._on_io_ready(fd, callback, args))
         notifier.setEnabled(True)
         self._notifiers[("w", fd)] = notifier
 
-    def _remove_writer(self, fd):
+    def _remove_writer(self, fd: int) -> bool:
+        """Remove a file descriptor from write events."""
+
         if isinstance(fd, socket.socket):
             fd = fd.fileno()
+
         key = ("w", fd)
         notifier = self._notifiers.pop(key, None)
+
         if notifier is not None:
             notifier.setEnabled(False)
             notifier.deleteLater()
             return True
+
         return False
 
     def _on_io_ready(self, fd, callback, args):
