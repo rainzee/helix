@@ -1,8 +1,10 @@
 import heapq
+import subprocess
 import sys
 import threading
-from asyncio import SelectorEventLoop
+from asyncio import SelectorEventLoop, SubprocessTransport
 from asyncio.events import _set_running_loop
+from asyncio.transports import ReadTransport, WriteTransport
 from selectors import BaseSelector, SelectorKey
 from socket import socket
 from typing import TYPE_CHECKING, override
@@ -10,6 +12,7 @@ from typing import TYPE_CHECKING, override
 from PySide6.QtCore import (
     QCoreApplication,
     QEventLoop,
+    QProcess,
     QSocketNotifier,
     QTimer,
 )
@@ -40,6 +43,214 @@ class PlaceholderSelector(BaseSelector):
     @override
     def get_map(self) -> dict:
         return {}
+
+
+class _StdinWriteTransport(WriteTransport):
+    """Write transport that forwards to QProcess stdin."""
+
+    def __init__(self, loop, qproc, protocol, fd):
+        super().__init__()
+        self._loop = loop
+        self._qproc = qproc
+        self._protocol = protocol
+        self._fd = fd
+        self._closing = False
+
+    def write(self, data):
+        if self._closing:
+            return
+        self._qproc.write(data)
+
+    def write_eof(self):
+        self.close()
+
+    def can_write_eof(self):
+        return True
+
+    def close(self):
+        if self._closing:
+            return
+        self._closing = True
+        self._qproc.closeWriteChannel()
+        self._loop.call_soon(self._protocol.pipe_connection_lost, self._fd, None)
+
+    def is_closing(self):
+        return self._closing
+
+    def get_extra_info(self, name, default=None):
+        return default
+
+
+class _ReadPipeTransport(ReadTransport):
+    """Read transport for a QProcess stdout/stderr channel."""
+
+    def __init__(self):
+        super().__init__()
+        self._closing = False
+        self._paused = False
+
+    def is_reading(self):
+        return not self._paused and not self._closing
+
+    def pause_reading(self):
+        self._paused = True
+
+    def resume_reading(self):
+        self._paused = False
+
+    def close(self):
+        self._closing = True
+
+    def is_closing(self):
+        return self._closing
+
+    def get_extra_info(self, name, default=None):
+        return default
+
+
+class _QProcessTransport(SubprocessTransport):
+    """Subprocess transport backed by QProcess — fully event-driven, no threads."""
+
+    def __init__(
+        self,
+        loop,
+        protocol,
+        args,
+        shell,
+        stdin,
+        stdout,
+        stderr,
+        bufsize,
+        waiter=None,
+        extra=None,
+        **kwargs,
+    ):
+        super().__init__(extra)
+        self._loop = loop
+        self._protocol = protocol
+        self._returncode = None
+        self._exit_waiters = []
+        self._pipes = {}
+        self._closed = False
+
+        self._qproc = QProcess()
+
+        # Wire QProcess signals
+        self._qproc.readyReadStandardOutput.connect(self._on_stdout)
+        self._qproc.readyReadStandardError.connect(self._on_stderr)
+        self._qproc.finished.connect(self._on_finished)
+
+        # Determine program and arguments
+        if shell:
+            cmd = args if isinstance(args, str) else subprocess.list2cmdline(args)
+            if sys.platform == "win32":
+                program = "cmd.exe"
+                self._qproc.setProgram(program)
+                self._qproc.setNativeArguments(f"/c {cmd}")
+            else:
+                program = "/bin/sh"
+                proc_args = ["-c", cmd]
+                self._qproc.setProgram(program)
+                self._qproc.setArguments(proc_args)
+        else:
+            arg_list = list(args) if not isinstance(args, str) else [args]
+            program = arg_list[0]
+            proc_args = arg_list[1:]
+            self._qproc.setProgram(program)
+            self._qproc.setArguments(proc_args)
+
+        # Create pipe transports based on requested channels
+        if stdin == subprocess.PIPE:
+            self._pipes[0] = _StdinWriteTransport(loop, self._qproc, protocol, 0)
+
+        if stdout == subprocess.PIPE:
+            self._pipes[1] = _ReadPipeTransport()
+
+        if stderr == subprocess.PIPE:
+            self._pipes[2] = _ReadPipeTransport()
+
+        # Start the process
+        self._qproc.start()
+        self._qproc.waitForStarted()
+        self._pid = self._qproc.processId()
+
+        # Notify protocol
+        loop.call_soon(protocol.connection_made, self)
+
+        # Resolve creation waiter
+        if waiter is not None:
+            loop.call_soon(waiter.set_result, None)
+
+    def _on_stdout(self):
+        data = self._qproc.readAllStandardOutput().data()
+        if data:
+            self._protocol.pipe_data_received(1, bytes(data))
+
+    def _on_stderr(self):
+        data = self._qproc.readAllStandardError().data()
+        if data:
+            self._protocol.pipe_data_received(2, bytes(data))
+
+    def _on_finished(self, exit_code, _exit_status):
+        self._returncode = exit_code
+
+        # Drain any remaining data
+        remaining_out = self._qproc.readAllStandardOutput().data()
+        if remaining_out:
+            self._protocol.pipe_data_received(1, bytes(remaining_out))
+
+        remaining_err = self._qproc.readAllStandardError().data()
+        if remaining_err:
+            self._protocol.pipe_data_received(2, bytes(remaining_err))
+
+        # Close read pipes
+        if 1 in self._pipes:
+            self._protocol.pipe_connection_lost(1, None)
+        if 2 in self._pipes:
+            self._protocol.pipe_connection_lost(2, None)
+
+        self._protocol.process_exited()
+
+        for waiter in self._exit_waiters:
+            if not waiter.cancelled():
+                waiter.set_result(exit_code)
+        self._exit_waiters.clear()
+
+    # --- SubprocessTransport interface ---
+
+    def get_pid(self):
+        return self._pid
+
+    def get_returncode(self):
+        return self._returncode
+
+    def get_pipe_transport(self, fd):
+        return self._pipes.get(fd)
+
+    def send_signal(self, signal):
+        self._qproc.kill()
+
+    def terminate(self):
+        self._qproc.terminate()
+
+    def kill(self):
+        self._qproc.kill()
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        for pipe_t in self._pipes.values():
+            pipe_t.close()
+        if self._returncode is None:
+            self._qproc.kill()
+
+    async def _wait(self):
+        if self._returncode is not None:
+            return self._returncode
+        waiter = self._loop.create_future()
+        self._exit_waiters.append(waiter)
+        return await waiter
 
 
 class QtEventLoop(SelectorEventLoop):
@@ -155,6 +366,42 @@ class QtEventLoop(SelectorEventLoop):
 
         self._notifiers.clear()
         super().close()
+
+    async def _make_subprocess_transport(
+        self,
+        protocol,
+        args,
+        shell,
+        stdin,
+        stdout,
+        stderr,
+        bufsize,
+        extra=None,
+        **kwargs,
+    ):
+        """Create a subprocess transport backed by QProcess."""
+        waiter = self.create_future()
+        transport = _QProcessTransport(
+            self,
+            protocol,
+            args,
+            shell,
+            stdin,
+            stdout,
+            stderr,
+            bufsize,
+            waiter=waiter,
+            extra=extra,
+            **kwargs,
+        )
+        try:
+            await waiter
+        except (SystemExit, KeyboardInterrupt):
+            raise
+        except BaseException:
+            transport.close()
+            raise
+        return transport
 
     def _pump(self) -> None:
         """
