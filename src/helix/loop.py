@@ -264,7 +264,6 @@ class QtEventLoop(SelectorEventLoop):
     def __init__(self, app: QCoreApplication) -> None:
         self._app = app
         self._notifiers: dict[tuple, QSocketNotifier] = {}
-        self._batch_size = 64
 
         super().__init__(selector=PlaceholderSelector())
 
