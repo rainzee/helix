@@ -21,19 +21,19 @@ class PlaceholderSelector(BaseSelector):
     """A no-op selector. We use QSocketNotifier for I/O, not select()."""
 
     @override
-    def register(self, fileobj, events, data=None):
+    def register(self, fileobj, events, data=None) -> SelectorKey:
         return SelectorKey(fileobj, 0, events, data)
 
     @override
-    def unregister(self, fileobj):
+    def unregister(self, fileobj) -> SelectorKey:
         return SelectorKey(fileobj, 0, 0, None)
 
     @override
-    def select(self, timeout=None):
+    def select(self, timeout: float | None = None) -> list:
         return []
 
     @override
-    def get_map(self):
+    def get_map(self) -> dict:
         return {}
 
 
@@ -62,17 +62,13 @@ class QtEventLoop(asyncio.SelectorEventLoop):
         # Use the null selector — I/O goes through QSocketNotifier
         super().__init__(selector=PlaceholderSelector())
 
-        # The pump timer: when active, fires at each Qt event loop iteration
-        # to drain asyncio's ready queue and advance scheduled timers.
         self._timer = QTimer()
         self._timer.setInterval(0)
         self._timer.setSingleShot(False)
         self._timer.timeout.connect(self._pump)
 
-        # The Qt event loop used by run_forever(). Using QEventLoop instead
-        # of QApplication.exec() allows multiple run_forever/stop cycles.
-        self._qt_loop: QEventLoop | None = None
         self._thread_id: int | None = None
+        self._qt_loop: QEventLoop | None = None
 
     # ------------------------------------------------------------------
     # Override: run_forever / stop
