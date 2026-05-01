@@ -313,17 +313,6 @@ class QtEventLoop(SelectorEventLoop):
         return handle
 
     @override
-    def call_soon_threadsafe(
-        self,
-        callback: "Callable",
-        *args,
-        context: "Context | None" = None,
-    ) -> "Handle":
-        """Override Asyncio's event loop call_soon_threadsafe to ensure the pump timer is active."""
-
-        return super().call_soon_threadsafe(callback, *args, context=context)
-
-    @override
     def call_later(
         self,
         delay: float,
