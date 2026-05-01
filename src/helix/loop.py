@@ -1,4 +1,3 @@
-import heapq
 import subprocess
 import sys
 import threading
@@ -20,7 +19,6 @@ from PySide6.QtCore import (
 if TYPE_CHECKING:
     from asyncio import TimerHandle
     from asyncio.events import Handle
-    from collections import deque
     from collections.abc import Callable
     from contextvars import Context
 
@@ -301,10 +299,6 @@ class QtEventLoop(SelectorEventLoop):
             _set_running_loop(None)
             self._set_coroutine_origin_tracking(False)  # type: ignore
             sys.set_asyncgen_hooks(*old_agen_hooks)
-
-    @override
-    def is_running(self) -> bool:
-        return self._thread_id is not None
 
     @override
     def call_soon(
